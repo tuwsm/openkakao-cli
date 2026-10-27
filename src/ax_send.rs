@@ -107,6 +107,29 @@ pub(crate) fn is_verified_delivery(
     composer_value == Some("") && has_new_exact_outgoing_message(before, after, target)
 }
 
+/// One step of the bounded feedback loop that scrolls the chat list until a
+/// chat row is reachable by moving the list's vertical scroll bar. `distance` is
+/// the vertical distance from the row's centre to the viewport's centre
+/// (positive: the row is below it), `range` the scrollable height (content minus
+/// viewport), `previous` the distance before the last step. Returns the new scroll
+/// bar value (0.0 top .. 1.0 bottom) and the sign to keep using — the sign flips
+/// when the last step made things worse, so the loop does not depend on which
+/// way the scroll bar value runs.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn next_scroll_value(
+    value: f64,
+    distance: f64,
+    range: f64,
+    previous: Option<f64>,
+    sign: f64,
+) -> (f64, f64) {
+    let sign = match previous {
+        Some(before) if distance.abs() > before.abs() + 1.0 => -sign,
+        _ => sign,
+    };
+    ((value + sign * distance / range).clamp(0.0, 1.0), sign)
+}
+
 #[cfg(test)]
 mod match_tests {
     use super::*;
@@ -297,6 +320,49 @@ mod match_tests {
     }
 }
 
+#[cfg(test)]
+mod scroll_tests {
+    use super::next_scroll_value;
+
+    #[test]
+    fn row_below_the_viewport_moves_the_scroll_bar_down() {
+        let (value, sign) = next_scroll_value(0.5, 100.0, 1_000.0, None, 1.0);
+        assert!((value - 0.6).abs() < 1e-9);
+        assert_eq!(sign, 1.0);
+    }
+
+    #[test]
+    fn row_above_the_viewport_moves_the_scroll_bar_up() {
+        let (value, _) = next_scroll_value(0.5, -250.0, 1_000.0, None, 1.0);
+        assert!((value - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_scroll_bar_value_stays_within_zero_and_one() {
+        assert_eq!(next_scroll_value(0.9, 5_000.0, 1_000.0, None, 1.0).0, 1.0);
+        assert_eq!(next_scroll_value(0.1, -5_000.0, 1_000.0, None, 1.0).0, 0.0);
+    }
+
+    #[test]
+    fn a_step_that_made_things_worse_flips_the_sign() {
+        let (value, sign) = next_scroll_value(0.6, 300.0, 1_000.0, Some(100.0), 1.0);
+        assert_eq!(sign, -1.0);
+        assert!((value - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn progress_or_no_movement_keeps_the_sign() {
+        assert_eq!(
+            next_scroll_value(0.5, 50.0, 1_000.0, Some(100.0), -1.0).1,
+            -1.0
+        );
+        assert_eq!(
+            next_scroll_value(0.5, 100.0, 1_000.0, Some(100.0), 1.0).1,
+            1.0
+        );
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
 
@@ -317,6 +383,7 @@ mod imp {
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFEqual, CFType, TCFType};
     use core_foundation::boolean::CFBoolean;
+    use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
     use core_graphics::display::CGDisplay;
     use core_graphics::event::{
@@ -339,11 +406,15 @@ mod imp {
     const VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(200);
     const COMPOSER_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
     const COMPOSER_VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+    // Bounded scroll-bar steps that bring a chat row inside the list viewport.
+    const LIST_SCROLL_STEPS: usize = 8;
+    const LIST_SCROLL_SETTLE: Duration = Duration::from_millis(200);
     const SNAPSHOT_MAX_DEPTH: usize = 128;
     const SNAPSHOT_MAX_NODES: usize = 20_000;
     // A large chat list can exceed five seconds on newer KakaoTalk/macOS builds.
-    // Keep a firm deadline while allowing the normal AX walk to finish.
-    const SNAPSHOT_MAX_DURATION: Duration = Duration::from_secs(30);
+    // Keep a firm deadline while allowing the normal AX walk to finish. 120 s matches
+    // the node limit at the ~6 ms per node measured here (720 chat rows, ~5k+ nodes).
+    const SNAPSHOT_MAX_DURATION: Duration = Duration::from_secs(120);
     const AX_MESSAGE_TIMEOUT_SECS: f32 = 1.0;
 
     struct DisplayWakeGuard {
@@ -906,6 +977,128 @@ mod imp {
         CGEvent::new(source).ok().map(|event| event.location())
     }
 
+    fn row_center(row: &AXUIElement) -> Result<CGPoint> {
+        let (origin, size) =
+            attr_as_frame(row).ok_or_else(|| anyhow!("chat row has no readable frame"))?;
+        if size.width < 1.0 || size.height < 1.0 {
+            anyhow::bail!("chat row has an empty frame");
+        }
+        Ok(CGPoint::new(
+            origin.x + size.width / 2.0,
+            origin.y + size.height / 2.0,
+        ))
+    }
+
+    fn row_not_reachable() -> anyhow::Error {
+        anyhow!("chat row is off-screen or covered at its center; scroll it into view and retry")
+    }
+
+    /// The nearest ancestor of `el` (at most eight levels up) with the given AX role.
+    fn ancestor_with_role(el: &AXUIElement, wanted: &str) -> Option<AXUIElement> {
+        let mut current = el.clone();
+        for _ in 0..8 {
+            current = current.parent().ok()?;
+            if role(&current) == wanted {
+                return Some(current);
+            }
+        }
+        None
+    }
+
+    /// The vertical scroll bar of a scroll area: the `AXScrollBar` child that declares a
+    /// vertical orientation, or failing that one taller than it is wide.
+    fn vertical_scroll_bar(area: &AXUIElement) -> Option<AXUIElement> {
+        let children = area.children().ok()?;
+        children.iter().map(|child| child.clone()).find(|child| {
+            role(child) == "AXScrollBar"
+                && (attr_as_string(child, "AXOrientation").as_deref()
+                    == Some("AXVerticalOrientation")
+                    || attr_as_frame(child).is_some_and(|(_, size)| size.height > size.width))
+        })
+    }
+
+    fn scroll_bar_value(bar: &AXUIElement) -> Option<f64> {
+        let attr: AXAttribute<CFType> = AXAttribute::new(&CFString::new("AXValue"));
+        bar.attribute(&attr)
+            .ok()
+            .and_then(|value| value.downcast::<CFNumber>())
+            .and_then(|number| number.to_f64())
+    }
+
+    /// Centre of `row` once the exact row is the topmost element there. A row far
+    /// down a long chat list sits outside the list viewport, where no hit test can
+    /// succeed, so it is brought into view first: the row is asked to scroll itself
+    /// (`AXScrollToVisible`, best effort), and if it is still unreachable the list's
+    /// vertical scroll bar is moved in a bounded feedback loop driven by the row's
+    /// live position. Nothing is clicked here — the caller's double click stays
+    /// gated by the same hit test.
+    fn reachable_row_center(row: &AXUIElement) -> Result<CGPoint> {
+        let center = row_center(row)?;
+        if hit_test_is_within(center, row) {
+            return Ok(center);
+        }
+
+        let _ = row.perform_action(&CFString::new("AXScrollToVisible"));
+        let deadline = Instant::now() + COMPOSER_VERIFY_TIMEOUT;
+        loop {
+            sleep(COMPOSER_VERIFY_POLL_INTERVAL);
+            let center = row_center(row)?;
+            if hit_test_is_within(center, row) {
+                return Ok(center);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+
+        let (Some(area), Some(table)) = (
+            ancestor_with_role(row, "AXScrollArea"),
+            ancestor_with_role(row, "AXTable"),
+        ) else {
+            return Err(row_not_reachable());
+        };
+        let (Some(bar), Some((area_origin, area_size)), Some((_, table_size))) = (
+            vertical_scroll_bar(&area),
+            attr_as_frame(&area),
+            attr_as_frame(&table),
+        ) else {
+            return Err(row_not_reachable());
+        };
+        let range = table_size.height - area_size.height;
+        if range < 1.0 {
+            return Err(row_not_reachable());
+        }
+        let aim_y = area_origin.y + area_size.height / 2.0;
+        let bar_value: AXAttribute<CFType> = AXAttribute::new(&CFString::new("AXValue"));
+        let mut value = scroll_bar_value(&bar).ok_or_else(row_not_reachable)?;
+        let mut sign = 1.0;
+        let mut previous: Option<f64> = None;
+        for _ in 0..LIST_SCROLL_STEPS {
+            let center = row_center(row)?;
+            if hit_test_is_within(center, row) {
+                return Ok(center);
+            }
+            let distance = center.y - aim_y;
+            let (next, next_sign) =
+                super::next_scroll_value(value, distance, range, previous, sign);
+            sign = next_sign;
+            previous = Some(distance);
+            if bar
+                .set_attribute(&bar_value, CFNumber::from(next).as_CFType())
+                .is_err()
+            {
+                break;
+            }
+            sleep(LIST_SCROLL_SETTLE);
+            value = scroll_bar_value(&bar).unwrap_or(next);
+        }
+        let center = row_center(row)?;
+        if hit_test_is_within(center, row) {
+            return Ok(center);
+        }
+        Err(row_not_reachable())
+    }
+
     /// Open a chat row that exposes no AX open action by double-clicking its
     /// center. KakaoTalk ignores mouse events posted to its pid, so the click
     /// goes through the HID tap — which is why the app is raised first and a
@@ -923,17 +1116,7 @@ mod imp {
             sleep(COMPOSER_VERIFY_POLL_INTERVAL);
         }
 
-        let (origin, size) =
-            attr_as_frame(row).ok_or_else(|| anyhow!("chat row has no readable frame"))?;
-        if size.width < 1.0 || size.height < 1.0 {
-            anyhow::bail!("chat row has an empty frame");
-        }
-        let center = CGPoint::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0);
-        if !hit_test_is_within(center, row) {
-            anyhow::bail!(
-                "chat row is off-screen or covered at its center; scroll it into view and retry"
-            );
-        }
+        let center = reachable_row_center(row)?;
 
         let restore = cursor_location();
         let clicked = (1..=2).try_for_each(|clicks| {
@@ -1842,11 +2025,8 @@ end run
         let (preview_sheet, send_button) = wait_for_clipboard_image_preview(&window)?;
         let preview_has_filename = false;
 
-        let authenticated_target =
-            crate::util::escape_terminal_text(&crate::util::truncate(chat_display_name, 80));
-        openkakao_cli::human_auth::require_device_owner_auth(&format!(
-            "Approve one KakaoTalk photo to ‘{authenticated_target}’ after reviewing the terminal preview"
-        ))?;
+        // Signed requests carry text only: a photo send is never authorised.
+        openkakao_cli::signed_request::require_verified_photo()?;
 
         // Revalidate the exact recipient and previewed basename immediately
         // before the first action that can upload the photo.
@@ -1961,10 +2141,10 @@ end run
         open_chat_row(&app, chat_display_name)?;
 
         let deadline = Instant::now() + OPEN_CHAT_TIMEOUT;
-        let elements = loop {
+        let (window, elements) = loop {
             if let Some(window) = find_chat_window(&app, chat_display_name)? {
                 if let Some(elements) = inspect_chat_window(&window)? {
-                    break elements;
+                    break (window, elements);
                 }
             }
             if Instant::now() >= deadline {
@@ -1991,18 +2171,19 @@ end run
 
         let baseline = delivery_observations(&message_table)?;
 
-        // Keep the OS-mediated human-presence boundary inside the one native
-        // transport implementation. This makes it impossible for a future
-        // command caller to reach a real AX send merely by forgetting its own
-        // prompt. At this point the signed process, unique target row, exact
-        // window, empty composer, and pre-send bubble baseline are all known;
-        // authentication happens immediately before the composer is changed.
-        let authenticated_target =
-            crate::util::escape_terminal_text(&crate::util::truncate(chat_display_name, 80));
-        openkakao_cli::human_auth::require_device_owner_auth(&format!(
-            "Approve one KakaoTalk message to ‘{authenticated_target}’ after reviewing the terminal preview"
-        ))?;
+        // Keep the signed-request boundary inside the one native transport
+        // implementation, so a future command caller cannot reach a real AX send
+        // without it. At this point the unique target row, exact window, empty
+        // composer, and pre-send bubble baseline are known; the last check happens
+        // immediately before the composer is changed: a verified signed request for
+        // exactly this room and body must be installed (signed_request::process).
+        openkakao_cli::signed_request::require_verified_send(chat_display_name, message)?;
 
+        // Bring KakaoTalk and the exact target window to the front first (same step the
+        // photo path uses); an already-open chat window otherwise stays in the background
+        // and the composer focus below cannot be verified.
+        focus_window_and_verify(&app, &window)
+            .context("could not focus exact target window before composer write")?;
         focus_and_verify(&field, "exact target composer")?;
         field
             .set_value(CFString::new(message).as_CFType())

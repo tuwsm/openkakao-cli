@@ -8,3 +8,4 @@ pub mod message_db;
 pub mod model;
 pub mod receive_inbox;
 pub mod safe_send;
+pub mod signed_request;

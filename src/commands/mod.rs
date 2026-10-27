@@ -15,4 +15,5 @@ pub mod read;
 pub mod rest;
 pub mod safe_send;
 pub mod send;
+pub mod signed_send;
 pub mod watch;

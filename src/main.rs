@@ -547,6 +547,14 @@ enum Commands {
         #[arg(long, help = "Preview the action without executing")]
         dry_run: bool,
     },
+    /// Send one signed request read from stdin via AX (msgcap fork; prints a result code only)
+    SignedSend,
+    /// Report whether this process is Accessibility-trusted (msgcap fork; no KakaoTalk contact)
+    AxTrust,
+    /// Compare titles from stdin with the chat list and print counts only (msgcap fork; opens no chat)
+    AxMatch,
+    /// Open the chat named in a mode-600 file and print only a result code (msgcap fork)
+    AxProbe { room_file: String },
     /// Queue and manually approve a crash-safe AX send
     SafeSend {
         #[command(subcommand)]
@@ -717,6 +725,10 @@ fn should_warn_about_server_login(command: &Commands) -> bool {
             | Commands::LocalSend { .. }
             | Commands::LocalSendPhoto { .. }
             | Commands::SafeSend { .. }
+            | Commands::SignedSend
+            | Commands::AxTrust
+            | Commands::AxMatch
+            | Commands::AxProbe { .. }
             | Commands::AxRead { .. }
             | Commands::AxWatch { .. }
             | Commands::NotifWatch { .. }
@@ -1392,6 +1404,23 @@ fn main() -> Result<()> {
                     json,
                 },
             )?
+        }
+        Commands::SignedSend => {
+            // The per-request allowlist lives in memory only: the verified request's
+            // room is the single allowed chat (no config file is read or written).
+            let mut config = config;
+            let code = commands::signed_send::run(|room| {
+                config.safety.allow_ax_send = true;
+                config.safety.allowed_send_chats = vec![room.to_string()];
+                require_ax_send(&config)?;
+                require_allowed_send_chat(&config, room)
+            });
+            std::process::exit(code);
+        }
+        Commands::AxTrust => std::process::exit(commands::signed_send::ax_trust()),
+        Commands::AxMatch => std::process::exit(commands::signed_send::ax_match()),
+        Commands::AxProbe { room_file } => {
+            std::process::exit(commands::signed_send::ax_probe(&room_file))
         }
         Commands::SafeSend { action } => match action {
             SafeSendAction::Propose {

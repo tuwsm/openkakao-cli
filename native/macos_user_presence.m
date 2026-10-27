@@ -92,3 +92,60 @@ int openkakao_authenticate_device_owner(const char *reason_utf8) {
         return authenticated ? 0 : 2;
     }
 }
+
+// Read one generic-password item (service/account) from the login keychain without
+// ever showing a prompt. Used to fetch the signed-request HMAC key; the item's ACL
+// decides which binaries may read it. The secret is copied into the caller's buffer.
+// Return codes: 0 success, 1 item not found, 2 access denied / would need user
+// interaction, 3 other failure, 4 buffer too small.
+int openkakao_read_keychain_secret(const char *service_utf8,
+                                   const char *account_utf8,
+                                   unsigned char *out,
+                                   size_t cap,
+                                   size_t *out_len) {
+    @autoreleasepool {
+        if (service_utf8 == NULL || account_utf8 == NULL || out == NULL || out_len == NULL) {
+            return 3;
+        }
+        *out_len = 0;
+        NSString *service = [NSString stringWithUTF8String:service_utf8];
+        NSString *account = [NSString stringWithUTF8String:account_utf8];
+        if (service == nil || account == nil) {
+            return 3;
+        }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        // Fail instead of prompting (LaunchAgent sessions must never open a dialog).
+        SecKeychainSetUserInteractionAllowed(FALSE);
+        NSDictionary *query = @{
+            (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
+            (__bridge id)kSecAttrService : service,
+            (__bridge id)kSecAttrAccount : account,
+            (__bridge id)kSecReturnData : @YES,
+            (__bridge id)kSecMatchLimit : (__bridge id)kSecMatchLimitOne,
+            (__bridge id)kSecUseAuthenticationUI : (__bridge id)kSecUseAuthenticationUIFail,
+        };
+#pragma clang diagnostic pop
+
+        CFTypeRef result = NULL;
+        OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+        if (status == errSecItemNotFound) {
+            return 1;
+        }
+        if (status == errSecInteractionNotAllowed || status == errSecAuthFailed ||
+            status == errSecUserCanceled || status == errSecNoAccessForItem) {
+            return 2;
+        }
+        if (status != errSecSuccess || result == NULL) {
+            return 3;
+        }
+        NSData *data = (__bridge_transfer NSData *)result;
+        if (data.length > cap) {
+            return 4;
+        }
+        memcpy(out, data.bytes, data.length);
+        *out_len = data.length;
+        return 0;
+    }
+}
